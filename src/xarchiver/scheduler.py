@@ -7,6 +7,7 @@ import sys
 import time
 
 from apscheduler.schedulers.background import BackgroundScheduler
+from apscheduler.triggers.cron import CronTrigger
 from apscheduler.triggers.interval import IntervalTrigger
 
 from .config import get_settings
@@ -32,12 +33,18 @@ def start_scheduler() -> None:
         level=getattr(logging, cfg.log_level.upper(), logging.INFO),
         format="%(asctime)s %(levelname)s %(name)s: %(message)s",
     )
-    logger.info("Starting scheduler (interval=%dmin)", cfg.sync_interval_minutes)
+
+    if cfg.sync_cron:
+        trigger = CronTrigger.from_crontab(cfg.sync_cron)
+        logger.info("Starting scheduler (cron=%s)", cfg.sync_cron)
+    else:
+        trigger = IntervalTrigger(minutes=cfg.sync_interval_minutes)
+        logger.info("Starting scheduler (every %dmin)", cfg.sync_interval_minutes)
 
     scheduler = BackgroundScheduler()
     scheduler.add_job(
         _sync_job,
-        trigger=IntervalTrigger(minutes=cfg.sync_interval_minutes),
+        trigger=trigger,
         id="bookmark_sync",
         next_run_time=__import__("datetime").datetime.now(),  # run immediately on start
     )

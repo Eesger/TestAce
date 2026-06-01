@@ -23,8 +23,13 @@ class Settings(BaseSettings):
     # Embeddings
     embed_model: str = "all-MiniLM-L6-v2"
 
+    # Idea extraction (Claude API)
+    anthropic_api_key: str = ""
+    idea_model: str = "claude-haiku-4-5-20251001"  # fast + cheap for batch extraction
+
     # Scheduler
-    sync_interval_minutes: int = 60
+    sync_interval_minutes: int = 1440  # default: once per day
+    sync_cron: str = ""               # if set, overrides interval (e.g. "0 8 * * *")
 
     # Logging
     log_level: str = "INFO"

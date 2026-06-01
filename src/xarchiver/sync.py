@@ -10,6 +10,7 @@ from . import db
 from .twitter import fetch_bookmarks, should_extract_article
 from .extractor import extract_article
 from .embedder import get_embedder
+from .ideas import extract_idea, IdeaResult
 
 logger = logging.getLogger(__name__)
 
@@ -21,6 +22,7 @@ class SyncResult:
     new_tweets: int = 0
     new_articles: int = 0
     new_embeddings: int = 0
+    new_ideas: int = 0
     errors: list[str] = field(default_factory=list)
 
 
@@ -113,8 +115,40 @@ def run_sync(full: bool = False) -> SyncResult:
     if new_tweet_ids:
         db.update_fts(new_tweet_ids)
 
+    # Extract core ideas via Claude API (skipped if ANTHROPIC_API_KEY not set)
+    cfg2 = get_settings()
+    if cfg2.anthropic_api_key:
+        tweets_without_ideas = db.get_tweets_without_ideas()
+        if tweets_without_ideas:
+            logger.info("Extracting ideas for %d tweets", len(tweets_without_ideas))
+        for row in tweets_without_ideas:
+            article = db.get_best_article_for_tweet(row["tweet_id"])
+            idea = extract_idea(
+                tweet_id=row["tweet_id"],
+                tweet_text=row["text"],
+                author=row["author_username"],
+                article_id=article["id"] if article else None,
+                article_title=article["title"] if article else None,
+                article_body=article["body_text"] if article else None,
+            )
+            if idea:
+                db.upsert_idea(
+                    db.IdeaData(
+                        tweet_id=idea.tweet_id,
+                        article_id=idea.article_id,
+                        summary=idea.summary,
+                        key_concepts=idea.key_concepts,
+                        category=idea.category,
+                        tags=idea.tags,
+                        relevance_score=idea.relevance_score,
+                    )
+                )
+                result.new_ideas += 1
+    else:
+        logger.debug("ANTHROPIC_API_KEY not set — skipping idea extraction")
+
     logger.info(
-        "Sync complete: %d tweets, %d articles, %d embeddings",
-        result.new_tweets, result.new_articles, result.new_embeddings,
+        "Sync complete: %d tweets, %d articles, %d embeddings, %d ideas",
+        result.new_tweets, result.new_articles, result.new_embeddings, result.new_ideas,
     )
     return result

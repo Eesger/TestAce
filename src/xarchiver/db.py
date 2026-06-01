@@ -91,6 +91,20 @@ CREATE VIRTUAL TABLE IF NOT EXISTS search_index USING fts5(
     hashtags,
     tokenize = 'porter unicode61'
 );
+
+CREATE TABLE IF NOT EXISTS ideas (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    tweet_id        TEXT NOT NULL REFERENCES tweets(tweet_id) ON DELETE CASCADE,
+    article_id      INTEGER REFERENCES articles(id) ON DELETE SET NULL,
+    summary         TEXT NOT NULL,
+    key_concepts    TEXT NOT NULL,
+    category        TEXT NOT NULL DEFAULT 'other',
+    tags            TEXT NOT NULL,
+    relevance_score REAL DEFAULT 0.5,
+    brain_pushed    INTEGER NOT NULL DEFAULT 0,
+    created_at      TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ','now')),
+    UNIQUE(tweet_id)
+);
 """
 
 
@@ -332,6 +346,10 @@ def get_stats() -> dict[str, Any]:
         "SELECT COUNT(*) FROM articles WHERE body_text IS NOT NULL"
     ).fetchone()[0]
     embeddings = conn.execute("SELECT COUNT(*) FROM embeddings").fetchone()[0]
+    ideas = conn.execute("SELECT COUNT(*) FROM ideas").fetchone()[0]
+    ideas_pending = conn.execute(
+        "SELECT COUNT(*) FROM ideas WHERE brain_pushed=0 AND relevance_score >= 0.3"
+    ).fetchone()[0]
     last_sync = conn.execute(
         "SELECT MAX(last_sync_at) FROM sync_state"
     ).fetchone()[0]
@@ -342,6 +360,8 @@ def get_stats() -> dict[str, Any]:
         "articles": articles,
         "articles_with_text": articles_with_text,
         "embeddings": embeddings,
+        "ideas": ideas,
+        "ideas_pending_brain": ideas_pending,
         "last_sync": last_sync or "never",
         "db_size_mb": round(db_size_mb, 2),
     }
@@ -362,3 +382,95 @@ def get_tweet_by_id(tweet_id: str) -> sqlite3.Row | None:
 
 def get_article_by_id(article_id: str) -> sqlite3.Row | None:
     return get_conn().execute("SELECT * FROM articles WHERE id=?", (article_id,)).fetchone()
+
+
+# ---------------------------------------------------------------------------
+# Ideas helpers
+# ---------------------------------------------------------------------------
+
+@dataclass
+class IdeaData:
+    tweet_id: str
+    article_id: int | None
+    summary: str
+    key_concepts: list[str]
+    category: str
+    tags: list[str]
+    relevance_score: float
+
+
+def upsert_idea(idea: IdeaData) -> int:
+    conn = get_conn()
+    conn.execute(
+        """
+        INSERT INTO ideas
+            (tweet_id, article_id, summary, key_concepts, category, tags, relevance_score)
+        VALUES (?,?,?,?,?,?,?)
+        ON CONFLICT(tweet_id) DO UPDATE SET
+            summary         = excluded.summary,
+            key_concepts    = excluded.key_concepts,
+            category        = excluded.category,
+            tags            = excluded.tags,
+            relevance_score = excluded.relevance_score
+        """,
+        (
+            idea.tweet_id, idea.article_id, idea.summary,
+            json.dumps(idea.key_concepts), idea.category,
+            json.dumps(idea.tags), idea.relevance_score,
+        ),
+    )
+    conn.commit()
+    row = conn.execute("SELECT id FROM ideas WHERE tweet_id=?", (idea.tweet_id,)).fetchone()
+    return row["id"]
+
+
+def get_tweets_without_ideas() -> list[sqlite3.Row]:
+    return get_conn().execute(
+        """
+        SELECT t.tweet_id, t.text, t.author_username
+        FROM tweets t
+        WHERE NOT EXISTS (SELECT 1 FROM ideas i WHERE i.tweet_id = t.tweet_id)
+        """
+    ).fetchall()
+
+
+def get_best_article_for_tweet(tweet_id: str) -> sqlite3.Row | None:
+    """Return the article with the most body text for this tweet."""
+    return get_conn().execute(
+        """
+        SELECT id, title, body_text, author
+        FROM articles
+        WHERE tweet_id=? AND body_text IS NOT NULL
+        ORDER BY LENGTH(body_text) DESC
+        LIMIT 1
+        """,
+        (tweet_id,),
+    ).fetchone()
+
+
+def get_pending_brain_push(min_relevance: float = 0.3) -> list[sqlite3.Row]:
+    return get_conn().execute(
+        """
+        SELECT i.id, i.tweet_id, i.article_id, i.summary, i.key_concepts,
+               i.category, i.tags, i.relevance_score,
+               t.text AS tweet_text, t.author_username AS author,
+               a.title AS article_title, a.url AS article_url
+        FROM ideas i
+        JOIN tweets t ON t.tweet_id = i.tweet_id
+        LEFT JOIN articles a ON a.id = i.article_id
+        WHERE i.brain_pushed = 0
+          AND i.relevance_score >= ?
+        ORDER BY i.relevance_score DESC
+        """,
+        (min_relevance,),
+    ).fetchall()
+
+
+def mark_ideas_pushed(idea_ids: list[int]) -> None:
+    if not idea_ids:
+        return
+    placeholders = ",".join("?" * len(idea_ids))
+    get_conn().execute(
+        f"UPDATE ideas SET brain_pushed=1 WHERE id IN ({placeholders})", idea_ids
+    )
+    get_conn().commit()

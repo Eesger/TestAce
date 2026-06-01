@@ -1,6 +1,7 @@
-"""CLI entry point — xarchiver auth | sync | search | stats"""
+"""CLI entry point — xarchiver auth | sync | search | stats | brain-sync"""
 from __future__ import annotations
 
+import json as json_lib
 import logging
 import sys
 
@@ -47,6 +48,7 @@ def sync(full: bool) -> None:
     table.add_row("New tweets", str(result.new_tweets))
     table.add_row("Articles extracted", str(result.new_articles))
     table.add_row("New embeddings", str(result.new_embeddings))
+    table.add_row("Ideas extracted", str(result.new_ideas))
     if result.errors:
         table.add_row("[red]Errors[/]", str(len(result.errors)))
     console.print(table)
@@ -99,6 +101,63 @@ def search(query: str, mode: str, limit: int) -> None:
         console.print(f"   [dim]score={hit.score:.4f}[/]\n")
 
 
+@main.command("brain-sync")
+@click.option("--json", "as_json", is_flag=True, help="Output pending ideas as JSON (for scripting).")
+@click.option("--mark-pushed", multiple=True, type=int, metavar="ID",
+              help="Mark idea IDs as pushed to Open Brain.")
+@click.option("--min-relevance", default=0.3, show_default=True,
+              help="Minimum relevance score to include.")
+def brain_sync(as_json: bool, mark_pushed: tuple[int, ...], min_relevance: float) -> None:
+    """List ideas pending Open Brain sync, or mark them as pushed."""
+    from . import db
+
+    db.init_db()
+
+    if mark_pushed:
+        db.mark_ideas_pushed(list(mark_pushed))
+        if not as_json:
+            console.print(f"[green]Marked {len(mark_pushed)} idea(s) as pushed.[/]")
+        return
+
+    rows = db.get_pending_brain_push(min_relevance=min_relevance)
+
+    if as_json:
+        output = []
+        for r in rows:
+            output.append({
+                "id": r["id"],
+                "tweet_id": r["tweet_id"],
+                "author": r["author"],
+                "summary": r["summary"],
+                "key_concepts": json_lib.loads(r["key_concepts"] or "[]"),
+                "category": r["category"],
+                "tags": json_lib.loads(r["tags"] or "[]"),
+                "relevance_score": r["relevance_score"],
+                "tweet_text": r["tweet_text"],
+                "article_title": r["article_title"],
+                "article_url": r["article_url"],
+            })
+        click.echo(json_lib.dumps(output, ensure_ascii=False, indent=2))
+        return
+
+    if not rows:
+        console.print("[yellow]No ideas pending Open Brain sync.[/]")
+        return
+
+    console.print(f"\n[bold]{len(rows)} idea(s) pending Open Brain sync[/] "
+                  f"[dim](relevance ≥ {min_relevance})[/]\n")
+    for r in rows:
+        concepts = ", ".join(json_lib.loads(r["key_concepts"] or "[]"))
+        tags = " ".join(f"[dim]#{t}[/]" for t in json_lib.loads(r["tags"] or "[]"))
+        console.print(f"[bold]#{r['id']}[/] [[cyan]{r['category']}[/]] @{r['author']}")
+        console.print(f"   {r['summary']}")
+        if concepts:
+            console.print(f"   [dim]concepts:[/] {concepts}")
+        console.print(f"   {tags}  [dim]score={r['relevance_score']:.2f}[/]\n")
+
+    console.print("[dim]Run /sync-brain in Claude Code to push these to Open Brain.[/]")
+
+
 @main.command()
 def stats() -> None:
     """Show database statistics."""
@@ -113,6 +172,8 @@ def stats() -> None:
     table.add_row("Tweets stored", str(s["tweets"]))
     table.add_row("Articles (total URLs)", str(s["articles"]))
     table.add_row("Articles with text", str(s["articles_with_text"]))
+    table.add_row("Ideas extracted", str(s["ideas"]))
+    table.add_row("Ideas pending Open Brain", str(s["ideas_pending_brain"]))
     table.add_row("Embeddings", str(s["embeddings"]))
     table.add_row("Last sync", str(s["last_sync"]))
     table.add_row("DB size (MB)", str(s["db_size_mb"]))
