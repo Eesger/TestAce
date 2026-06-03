@@ -3,6 +3,7 @@ from __future__ import annotations
 import os
 from functools import lru_cache
 
+from pydantic import field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -37,6 +38,13 @@ class Settings(BaseSettings):
 
     # Logging
     log_level: str = "INFO"
+
+    @field_validator("twitter_token_expires_at", mode="before")
+    @classmethod
+    def _coerce_expires_at(cls, v: object) -> float:
+        if v == "" or v is None:
+            return 0.0
+        return float(v)
 
 
 @lru_cache(maxsize=1)
