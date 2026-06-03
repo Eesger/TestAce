@@ -3,14 +3,11 @@ from __future__ import annotations
 
 import base64
 import hashlib
-import http.server
 import logging
 import os
 import secrets
 import time
 import urllib.parse
-import webbrowser
-from threading import Thread
 
 import httpx
 from dotenv import set_key
@@ -24,23 +21,6 @@ AUTH_URL = "https://twitter.com/i/oauth2/authorize"
 REDIRECT_URI = "http://127.0.0.1:8080/callback"
 SCOPES = "tweet.read users.read bookmark.read offline.access"
 
-_captured_code: str | None = None
-
-
-class _CallbackHandler(http.server.BaseHTTPRequestHandler):
-    def do_GET(self) -> None:
-        global _captured_code
-        parsed = urllib.parse.urlparse(self.path)
-        params = urllib.parse.parse_qs(parsed.query)
-        if "code" in params:
-            _captured_code = params["code"][0]
-        self.send_response(200)
-        self.end_headers()
-        self.wfile.write(b"<h2>Auth complete. Return to terminal.</h2>")
-
-    def log_message(self, *_: object) -> None:
-        pass
-
 
 def _make_pkce_pair() -> tuple[str, str]:
     verifier = secrets.token_urlsafe(64)
@@ -50,10 +30,7 @@ def _make_pkce_pair() -> tuple[str, str]:
 
 
 def run_auth_flow() -> None:
-    """Interactive PKCE flow — opens the browser and writes tokens to .env."""
-    global _captured_code
-    _captured_code = None
-
+    """Manual PKCE flow — prints the URL, user pastes back the callback URL."""
     cfg = get_settings()
     if not cfg.twitter_client_id:
         raise RuntimeError("TWITTER_CLIENT_ID not set in .env")
@@ -72,29 +49,47 @@ def run_auth_flow() -> None:
     }
     auth_url = AUTH_URL + "?" + urllib.parse.urlencode(params)
 
-    server = http.server.HTTPServer(("127.0.0.1", 8080), _CallbackHandler)
-    t = Thread(target=server.handle_request)
-    t.start()
+    print("\n" + "=" * 60)
+    print("Stap 1 — Open deze URL in je browser (zorg dat je ingelogd")
+    print("         bent met je PERSOONLIJKE X account):")
+    print()
+    print(auth_url)
+    print()
+    print("Stap 2 — Klik op 'Authorize app' in de browser.")
+    print()
+    print("Stap 3 — De browser probeert door te sturen naar")
+    print("         http://127.0.0.1:8080/callback?code=...")
+    print("         De pagina laadt NIET — dat is normaal.")
+    print("         Kopieer de volledige URL uit de adresbalk.")
+    print("=" * 60 + "\n")
 
-    print(f"\nOpening browser for X.com authorization...\n{auth_url}\n")
-    webbrowser.open(auth_url)
-    t.join(timeout=120)
-    server.server_close()
+    raw = input("Plak hier de volledige callback URL: ").strip()
 
-    if not _captured_code:
-        raise RuntimeError("No authorization code received within 120s.")
+    # Accept either the full URL or just the bare code
+    if raw.startswith("http"):
+        parsed = urllib.parse.urlparse(raw)
+        params_cb = urllib.parse.parse_qs(parsed.query)
+        code = params_cb.get("code", [None])[0]
+    else:
+        code = raw  # user pasted just the code value
 
-    tokens = _exchange_code(_captured_code, verifier, cfg.twitter_client_id, cfg.twitter_client_secret)
+    if not code:
+        raise RuntimeError(
+            "Geen code gevonden in de URL. "
+            "Zorg dat je de volledige URL kopieert inclusief '?code=...'."
+        )
+
+    print("\nTokens ophalen bij X...")
+    tokens = _exchange_code(code, verifier, cfg.twitter_client_id, cfg.twitter_client_secret)
     _persist_tokens(tokens)
 
-    # Fetch and store user ID
     user_id = _fetch_user_id(tokens["access_token"])
-    _env_path = _find_env_file()
-    set_key(_env_path, "TWITTER_USER_ID", user_id)
-    print(f"Stored user ID: {user_id}")
+    set_key(_find_env_file(), "TWITTER_USER_ID", user_id)
 
     reload_settings()
-    print("Authentication complete. Tokens written to .env")
+    print(f"Klaar! User ID {user_id} opgeslagen in .env")
+    print("Je kunt nu 'xarchiver sync' uitvoeren.")
+
 
 
 def _exchange_code(code: str, verifier: str, client_id: str, client_secret: str) -> dict:
