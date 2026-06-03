@@ -2,9 +2,8 @@ services:
   archiver:
     build: .
     restart: unless-stopped
-    env_file: .env
+    env_file: .env          # contains all API keys + config
     volumes:
-      - ./data:/data
-      - ./.env:/app/.env:ro
+      - ./data:/data        # persists bookmarks.db between runs
     environment:
       - DB_PATH=/data/bookmarks.db

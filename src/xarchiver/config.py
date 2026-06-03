@@ -25,7 +25,11 @@ class Settings(BaseSettings):
 
     # Idea extraction (Claude API)
     anthropic_api_key: str = ""
-    idea_model: str = "claude-haiku-4-5-20251001"  # fast + cheap for batch extraction
+    idea_model: str = "claude-haiku-4-5-20251001"
+
+    # Notion publishing
+    notion_api_token: str = ""
+    notion_database_id: str = "f4875bf5afb4478495f651a8b28b55b1"
 
     # Scheduler
     sync_interval_minutes: int = 1440  # default: once per day

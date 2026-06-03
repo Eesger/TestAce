@@ -10,7 +10,7 @@ from . import db
 from .twitter import fetch_bookmarks, should_extract_article
 from .extractor import extract_article
 from .embedder import get_embedder
-from .ideas import extract_idea, IdeaResult
+from .ideas import extract_idea
 
 logger = logging.getLogger(__name__)
 
@@ -146,6 +146,37 @@ def run_sync(full: bool = False) -> SyncResult:
                 result.new_ideas += 1
     else:
         logger.debug("ANTHROPIC_API_KEY not set — skipping idea extraction")
+
+    # Publish new ideas to Notion (skipped if NOTION_* not configured)
+    if cfg2.notion_api_token and cfg2.notion_database_id:
+        from .notion_publisher import publish_idea
+        pending = db.get_unpublished_ideas()
+        if pending:
+            logger.info("Publishing %d ideas to Notion", len(pending))
+        for row in pending:
+            try:
+                import json as _json
+                page_id = publish_idea(
+                    tweet_id=row["tweet_id"],
+                    author=row["author"],
+                    summary=row["summary"],
+                    key_concepts=_json.loads(row["key_concepts"] or "[]"),
+                    category=row["category"],
+                    tags=_json.loads(row["tags"] or "[]"),
+                    relevance=row["relevance_score"],
+                    tweet_text=row["tweet_text"],
+                    tweet_url=f"https://twitter.com/{row['author']}/status/{row['tweet_id']}",
+                    article_title=row["article_title"],
+                    article_body=row["article_body"],
+                    article_url=row["article_url"],
+                    bookmarked_at=row["tweet_created_at"],
+                )
+                db.set_notion_page_id(row["tweet_id"], page_id)
+            except Exception as exc:
+                result.errors.append(f"Notion publish failed for {row['tweet_id']}: {exc}")
+                logger.error("Notion publish error: %s", exc)
+    else:
+        logger.debug("NOTION_API_TOKEN/DATABASE_ID not set — skipping Notion publish")
 
     logger.info(
         "Sync complete: %d tweets, %d articles, %d embeddings, %d ideas",

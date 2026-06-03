@@ -10,6 +10,8 @@ from rich.console import Console
 from rich.table import Table
 from rich import box
 
+from .config import get_settings
+
 console = Console()
 
 
@@ -101,31 +103,30 @@ def search(query: str, mode: str, limit: int) -> None:
         console.print(f"   [dim]score={hit.score:.4f}[/]\n")
 
 
-@main.command("brain-sync")
-@click.option("--json", "as_json", is_flag=True, help="Output pending ideas as JSON (for scripting).")
-@click.option("--mark-pushed", multiple=True, type=int, metavar="ID",
-              help="Mark idea IDs as pushed to Open Brain.")
+@main.command("notion-sync")
+@click.option("--json", "as_json", is_flag=True, help="Output unpublished ideas as JSON.")
+@click.option("--set-page-id", nargs=2, multiple=True, metavar="TWEET_ID PAGE_ID",
+              help="Store a Notion page ID for a tweet (used by /sync-brain after MCP push).")
 @click.option("--min-relevance", default=0.3, show_default=True,
               help="Minimum relevance score to include.")
-def brain_sync(as_json: bool, mark_pushed: tuple[int, ...], min_relevance: float) -> None:
-    """List ideas pending Open Brain sync, or mark them as pushed."""
+def notion_sync(as_json: bool, set_page_id: tuple, min_relevance: float) -> None:
+    """Manage Notion publishing state. Outputs pending ideas or records page IDs."""
     from . import db
 
     db.init_db()
 
-    if mark_pushed:
-        db.mark_ideas_pushed(list(mark_pushed))
+    if set_page_id:
+        for tweet_id, page_id in set_page_id:
+            db.set_notion_page_id(tweet_id, page_id)
         if not as_json:
-            console.print(f"[green]Marked {len(mark_pushed)} idea(s) as pushed.[/]")
+            console.print(f"[green]Stored {len(set_page_id)} Notion page ID(s).[/]")
         return
 
-    rows = db.get_pending_brain_push(min_relevance=min_relevance)
+    rows = db.get_unpublished_ideas(min_relevance=min_relevance)
 
     if as_json:
-        output = []
-        for r in rows:
-            output.append({
-                "id": r["id"],
+        output = [
+            {
                 "tweet_id": r["tweet_id"],
                 "author": r["author"],
                 "summary": r["summary"],
@@ -136,26 +137,114 @@ def brain_sync(as_json: bool, mark_pushed: tuple[int, ...], min_relevance: float
                 "tweet_text": r["tweet_text"],
                 "article_title": r["article_title"],
                 "article_url": r["article_url"],
-            })
+                "article_body": (r["article_body"] or "")[:3000],
+                "tweet_url": f"https://twitter.com/{r['author']}/status/{r['tweet_id']}",
+                "bookmarked_at": r["tweet_created_at"],
+            }
+            for r in rows
+        ]
         click.echo(json_lib.dumps(output, ensure_ascii=False, indent=2))
         return
 
     if not rows:
-        console.print("[yellow]No ideas pending Open Brain sync.[/]")
+        console.print("[green]All ideas are in Notion.[/]")
         return
 
-    console.print(f"\n[bold]{len(rows)} idea(s) pending Open Brain sync[/] "
-                  f"[dim](relevance ≥ {min_relevance})[/]\n")
+    console.print(f"\n[bold]{len(rows)} idea(s) not yet in Notion[/] [dim](≥{min_relevance} relevance)[/]\n")
     for r in rows:
         concepts = ", ".join(json_lib.loads(r["key_concepts"] or "[]"))
-        tags = " ".join(f"[dim]#{t}[/]" for t in json_lib.loads(r["tags"] or "[]"))
-        console.print(f"[bold]#{r['id']}[/] [[cyan]{r['category']}[/]] @{r['author']}")
-        console.print(f"   {r['summary']}")
+        console.print(f"[[cyan]{r['category']}[/]] @{r['author']}  "
+                      f"[dim]score={r['relevance_score']:.2f}[/]")
+        console.print(f"  {r['summary'][:120]}")
         if concepts:
-            console.print(f"   [dim]concepts:[/] {concepts}")
-        console.print(f"   {tags}  [dim]score={r['relevance_score']:.2f}[/]\n")
+            console.print(f"  [dim]{concepts}[/]")
+        console.print()
 
-    console.print("[dim]Run /sync-brain in Claude Code to push these to Open Brain.[/]")
+    console.print("[dim]Run /sync-brain in Claude Code, or `xarchiver sync` with NOTION_API_TOKEN set.[/]")
+
+
+@main.command()
+@click.argument("tweet_id")
+@click.option("--refetch-article", is_flag=True,
+              help="Re-download and re-extract the article before reprocessing.")
+@click.option("--push/--no-push", default=True, show_default=True,
+              help="Update the Notion page after re-extraction.")
+def reprocess(tweet_id: str, refetch_article: bool, push: bool) -> None:
+    """Re-run Claude idea extraction for a specific bookmark. Updates Notion in place."""
+    from . import db
+    from .ideas import extract_idea
+    from .extractor import extract_article as _extract_article
+
+    db.init_db()
+
+    tweet = db.get_tweet_by_id(tweet_id)
+    if not tweet:
+        console.print(f"[red]Tweet {tweet_id} not found in database.[/]")
+        raise SystemExit(1)
+
+    existing_idea = db.get_idea_by_tweet(tweet_id)
+    existing_page_id = existing_idea["notion_page_id"] if existing_idea else None
+
+    if refetch_article:
+        console.print("[cyan]Re-fetching article...[/]")
+        articles = db.get_conn().execute(
+            "SELECT tweet_id, url FROM articles WHERE tweet_id=?", (tweet_id,)
+        ).fetchall()
+        for art_row in articles:
+            art = _extract_article(art_row["tweet_id"], art_row["url"])
+            db.upsert_article(art)
+
+    article = db.get_best_article_for_tweet(tweet_id)
+    console.print(f"[cyan]Re-extracting idea for tweet {tweet_id}...[/]")
+
+    idea = extract_idea(
+        tweet_id=tweet_id,
+        tweet_text=tweet["text"],
+        author=tweet["author_username"],
+        article_id=article["id"] if article else None,
+        article_title=article["title"] if article else None,
+        article_body=article["body_text"] if article else None,
+    )
+    if not idea:
+        console.print("[yellow]Extraction returned no result (tweet may be too short).[/]")
+        return
+
+    db.clear_idea(tweet_id)
+    db.upsert_idea(db.IdeaData(
+        tweet_id=idea.tweet_id, article_id=idea.article_id,
+        summary=idea.summary, key_concepts=idea.key_concepts,
+        category=idea.category, tags=idea.tags,
+        relevance_score=idea.relevance_score,
+    ))
+
+    console.print(f"[green]Re-extracted:[/] [{idea.category}] {idea.summary[:120]}")
+
+    if push:
+        cfg = get_settings()
+        if cfg.notion_api_token and cfg.notion_database_id:
+            from .notion_publisher import publish_idea
+            import json as _json
+            page_id = publish_idea(
+                tweet_id=tweet_id,
+                author=tweet["author_username"],
+                summary=idea.summary,
+                key_concepts=idea.key_concepts,
+                category=idea.category,
+                tags=idea.tags,
+                relevance=idea.relevance_score,
+                tweet_text=tweet["text"],
+                tweet_url=f"https://twitter.com/{tweet['author_username']}/status/{tweet_id}",
+                article_title=article["title"] if article else None,
+                article_body=article["body_text"] if article else None,
+                article_url=article["url"] if article else None,
+                existing_page_id=existing_page_id,
+                is_reeval=existing_page_id is not None,
+            )
+            db.set_notion_page_id(tweet_id, page_id)
+            action = "Updated" if existing_page_id else "Created"
+            console.print(f"[green]{action} Notion page {page_id}[/]")
+        else:
+            console.print("[yellow]NOTION_API_TOKEN not set — skipping Notion update.[/]")
 
 
 @main.command()
@@ -173,7 +262,8 @@ def stats() -> None:
     table.add_row("Articles (total URLs)", str(s["articles"]))
     table.add_row("Articles with text", str(s["articles_with_text"]))
     table.add_row("Ideas extracted", str(s["ideas"]))
-    table.add_row("Ideas pending Open Brain", str(s["ideas_pending_brain"]))
+    table.add_row("Ideas in Notion", str(s["ideas_in_notion"]))
+    table.add_row("Ideas pending Notion", str(s["ideas_pending_notion"]))
     table.add_row("Embeddings", str(s["embeddings"]))
     table.add_row("Last sync", str(s["last_sync"]))
     table.add_row("DB size (MB)", str(s["db_size_mb"]))

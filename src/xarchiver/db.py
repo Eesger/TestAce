@@ -101,7 +101,7 @@ CREATE TABLE IF NOT EXISTS ideas (
     category        TEXT NOT NULL DEFAULT 'other',
     tags            TEXT NOT NULL,
     relevance_score REAL DEFAULT 0.5,
-    brain_pushed    INTEGER NOT NULL DEFAULT 0,
+    notion_page_id  TEXT DEFAULT NULL,
     created_at      TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ','now')),
     UNIQUE(tweet_id)
 );
@@ -115,7 +115,21 @@ def init_db() -> None:
         if s:
             conn.execute(s)
     conn.commit()
+    _migrate(conn)
     logger.debug("Database initialised at %s", get_settings().db_path)
+
+
+def _migrate(conn: sqlite3.Connection) -> None:
+    """Apply incremental schema migrations for existing databases."""
+    migrations = [
+        "ALTER TABLE ideas ADD COLUMN notion_page_id TEXT DEFAULT NULL",
+    ]
+    for sql in migrations:
+        try:
+            conn.execute(sql)
+            conn.commit()
+        except sqlite3.OperationalError:
+            pass  # column already exists
 
 
 # ---------------------------------------------------------------------------
@@ -348,7 +362,10 @@ def get_stats() -> dict[str, Any]:
     embeddings = conn.execute("SELECT COUNT(*) FROM embeddings").fetchone()[0]
     ideas = conn.execute("SELECT COUNT(*) FROM ideas").fetchone()[0]
     ideas_pending = conn.execute(
-        "SELECT COUNT(*) FROM ideas WHERE brain_pushed=0 AND relevance_score >= 0.3"
+        "SELECT COUNT(*) FROM ideas WHERE notion_page_id IS NULL AND relevance_score >= 0.3"
+    ).fetchone()[0]
+    ideas_in_notion = conn.execute(
+        "SELECT COUNT(*) FROM ideas WHERE notion_page_id IS NOT NULL"
     ).fetchone()[0]
     last_sync = conn.execute(
         "SELECT MAX(last_sync_at) FROM sync_state"
@@ -361,7 +378,8 @@ def get_stats() -> dict[str, Any]:
         "articles_with_text": articles_with_text,
         "embeddings": embeddings,
         "ideas": ideas,
-        "ideas_pending_brain": ideas_pending,
+        "ideas_pending_notion": ideas_pending,
+        "ideas_in_notion": ideas_in_notion,
         "last_sync": last_sync or "never",
         "db_size_mb": round(db_size_mb, 2),
     }
@@ -424,6 +442,13 @@ def upsert_idea(idea: IdeaData) -> int:
     return row["id"]
 
 
+def clear_idea(tweet_id: str) -> None:
+    """Delete the extracted idea for a tweet so it can be reprocessed."""
+    conn = get_conn()
+    conn.execute("DELETE FROM ideas WHERE tweet_id=?", (tweet_id,))
+    conn.commit()
+
+
 def get_tweets_without_ideas() -> list[sqlite3.Row]:
     return get_conn().execute(
         """
@@ -438,7 +463,7 @@ def get_best_article_for_tweet(tweet_id: str) -> sqlite3.Row | None:
     """Return the article with the most body text for this tweet."""
     return get_conn().execute(
         """
-        SELECT id, title, body_text, author
+        SELECT id, title, body_text, author, url
         FROM articles
         WHERE tweet_id=? AND body_text IS NOT NULL
         ORDER BY LENGTH(body_text) DESC
@@ -448,17 +473,20 @@ def get_best_article_for_tweet(tweet_id: str) -> sqlite3.Row | None:
     ).fetchone()
 
 
-def get_pending_brain_push(min_relevance: float = 0.3) -> list[sqlite3.Row]:
+def get_unpublished_ideas(min_relevance: float = 0.3) -> list[sqlite3.Row]:
+    """Ideas that haven't been pushed to Notion yet."""
     return get_conn().execute(
         """
         SELECT i.id, i.tweet_id, i.article_id, i.summary, i.key_concepts,
-               i.category, i.tags, i.relevance_score,
+               i.category, i.tags, i.relevance_score, i.notion_page_id,
                t.text AS tweet_text, t.author_username AS author,
-               a.title AS article_title, a.url AS article_url
+               t.created_at AS tweet_created_at,
+               a.title AS article_title, a.url AS article_url,
+               a.body_text AS article_body
         FROM ideas i
         JOIN tweets t ON t.tweet_id = i.tweet_id
         LEFT JOIN articles a ON a.id = i.article_id
-        WHERE i.brain_pushed = 0
+        WHERE i.notion_page_id IS NULL
           AND i.relevance_score >= ?
         ORDER BY i.relevance_score DESC
         """,
@@ -466,11 +494,15 @@ def get_pending_brain_push(min_relevance: float = 0.3) -> list[sqlite3.Row]:
     ).fetchall()
 
 
-def mark_ideas_pushed(idea_ids: list[int]) -> None:
-    if not idea_ids:
-        return
-    placeholders = ",".join("?" * len(idea_ids))
-    get_conn().execute(
-        f"UPDATE ideas SET brain_pushed=1 WHERE id IN ({placeholders})", idea_ids
+def set_notion_page_id(tweet_id: str, page_id: str) -> None:
+    conn = get_conn()
+    conn.execute(
+        "UPDATE ideas SET notion_page_id=? WHERE tweet_id=?", (page_id, tweet_id)
     )
-    get_conn().commit()
+    conn.commit()
+
+
+def get_idea_by_tweet(tweet_id: str) -> sqlite3.Row | None:
+    return get_conn().execute(
+        "SELECT * FROM ideas WHERE tweet_id=?", (tweet_id,)
+    ).fetchone()

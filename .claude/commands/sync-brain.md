@@ -1,33 +1,63 @@
-Push pending AI insights from the X bookmark archiver into Open Brain.
+Push unpublished AI bookmark insights into the Notion "AI Bookmark Knowledge Base" database.
 
 ## Steps
 
-1. Run this command and capture the output:
-   ```
-   xarchiver brain-sync --json
-   ```
+**1. Get pending ideas**
 
-2. Parse the JSON array. If it is empty, report "No new ideas to push" and stop.
+Run this bash command and capture the output:
+```
+xarchiver notion-sync --json
+```
 
-3. For each idea in the array, call the `capture_thought` tool with:
-   - **content**: a formatted markdown string built like this:
-     ```
-     **[{category}]** {summary}
+If the array is empty, report "Nothing to publish — all ideas are already in Notion." and stop.
 
-     **Key concepts:** {key_concepts joined with ", "}
-     **Source:** @{author} — https://twitter.com/{author}/status/{tweet_id}
-     {if article_title exists: "**Article:** {article_title}"}
-     {if article_url exists: "{article_url}"}
-     ```
-   - **category**: the idea's `category` field (e.g. "rag", "agents", "architecture")
-   - **tags**: the idea's `tags` array
-   - **source**: `"x-bookmark-archiver"`
+**2. Push each idea to Notion**
 
-4. Collect the IDs of all successfully pushed ideas (the `id` field from the JSON).
+For each item in the JSON array, call the `notion-create-pages` tool with:
 
-5. Mark them as pushed by running:
-   ```
-   xarchiver brain-sync --mark-pushed {space-separated ids}
-   ```
+- **parent**: `{ "database_id": "f4875bf5afb4478495f651a8b28b55b1" }`
+- **properties** (use the exact property names):
+  - `Name`: the `summary` field (first 200 chars)
+  - `Author`: the `author` field
+  - `Category`: the `category` field
+  - `Tags`: the `tags` array (as multi-select)
+  - `Relevance`: the `relevance_score` number
+  - `Status`: `"New"`
+  - `Key Concepts`: the `key_concepts` joined with `, `
+  - `Tweet ID`: the `tweet_id` field (required for deduplication)
+  - `Tweet URL`: the `tweet_url` field
+  - `Article URL`: the `article_url` field (if present)
+  - `Article Title`: the `article_title` field (if present)
+  - `Bookmarked`: the `bookmarked_at` date (if present)
+- **content** (Notion Markdown):
+```
+> 💡 {summary}
 
-6. Report a summary: how many ideas were pushed, and list their categories and top tags.
+## Key Concepts
+{key_concepts as bullet list}
+
+## Original Tweet
+> {tweet_text}
+
+{if article_title and article_body:}
+## Article: {article_title}
+{first 2000 chars of article_body}
+```
+
+Collect each `tweet_id` → Notion page ID mapping from the create response.
+
+**3. Record page IDs in SQLite**
+
+After all pages are created, run one bash command per idea to record the mapping:
+```
+xarchiver notion-sync --set-page-id {tweet_id} {notion_page_id}
+```
+
+Or batch them:
+```
+xarchiver notion-sync --set-page-id tweet1 page1 --set-page-id tweet2 page2
+```
+
+**4. Report**
+
+Summarise: how many ideas were published, what categories they covered, and any failures.
