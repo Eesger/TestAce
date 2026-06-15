@@ -1,0 +1,37 @@
+{
+  "main": {
+    "id": "13204667f5f4e58f",
+    "type": "split",
+    "children": [
+      {
+        "id": "abc9e73efcfdfc77",
+        "type": "tabs",
+        "children": [
+          {
+            "id": "27d4ad4ad4ac4ac3",
+            "type": "leaf",
+            "state": {
+              "type": "markdown",
+              "state": {
+                "file": "README.md"
+              }
+            }
+          }
+        ]
+      }
+    ],
+    "direction": "vertical"
+  },
+  "left": {
+    "id": "ddcf6be876cb6361",
+    "type": "mobile-drawer",
+    "children": [
+      {
+        "id": "file-explorer",
+        "type": "file-explorer-view"
+      }
+    ],
+    "currentTab": 0
+  },
+  "lastOpenFiles": ["README.md"]
+}

@@ -1,0 +1,12 @@
+{
+  "baseFontSize": 16,
+  "translucency": false,
+  "useTab": true,
+  "lineNumbers": false,
+  "lineWrap": true,
+  "showLineNumber": false,
+  "strictLineBreaks": false,
+  "tabType": "space",
+  "tabSize": 2,
+  "useMarkdownLinks": true
+}
