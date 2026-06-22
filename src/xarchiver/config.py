@@ -32,6 +32,10 @@ class Settings(BaseSettings):
     notion_api_token: str = ""
     notion_database_id: str = "f4875bf5afb4478495f651a8b28b55b1"
 
+    # Birdclaw integration
+    sync_source: str = "birdclaw"   # "birdclaw" or "xapi"
+    birdclaw_home: str = ""         # leave empty to auto-detect (~/.birdclaw)
+
     # Scheduler
     sync_interval_minutes: int = 1440  # default: once per day
     sync_cron: str = ""               # if set, overrides interval (e.g. "0 8 * * *")

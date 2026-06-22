@@ -27,22 +27,54 @@ class SyncResult:
 
 
 def run_sync(full: bool = False) -> SyncResult:
-    """
-    full=False: stop pagination when an already-stored tweet is encountered.
-    full=True: page through all bookmarks regardless.
-    """
     cfg = get_settings()
+    db.init_db()
+
+    if cfg.sync_source == "birdclaw":
+        return _sync_from_birdclaw(cfg, full)
+    else:
+        return _sync_from_xapi(cfg, full)
+
+
+def _sync_from_birdclaw(cfg, full: bool) -> SyncResult:
+    from .birdclaw_reader import read_bookmarks
+
+    result = SyncResult()
+    known_ids: set[str] = set() if full else _get_known_ids()
+
+    logger.info("Reading bookmarks from Birdclaw (full=%s)", full)
+    try:
+        tweets = read_bookmarks(cfg.birdclaw_home or None, known_ids)
+    except RuntimeError as exc:
+        result.errors.append(str(exc))
+        logger.error("%s", exc)
+        return result
+
+    new_tweet_ids: list[str] = []
+    for tweet in tweets:
+        db.upsert_tweet(tweet)
+        new_tweet_ids.append(tweet.tweet_id)
+        result.new_tweets += 1
+        for url_obj in tweet.urls:
+            expanded = url_obj.get("expanded_url", "") or url_obj.get("url", "")
+            if expanded and should_extract_article(expanded):
+                db.upsert_article(db.ArticleData(tweet_id=tweet.tweet_id, url=expanded, fetch_status=0))
+
+    db.set_sync_state("birdclaw", None)
+    logger.info("Loaded %d new tweets from Birdclaw", result.new_tweets)
+    return _process_pipeline(result, new_tweet_ids)
+
+
+def _sync_from_xapi(cfg, full: bool) -> SyncResult:
     if not cfg.twitter_user_id:
         raise RuntimeError("TWITTER_USER_ID not set. Run `xarchiver auth` first.")
 
-    db.init_db()
     result = SyncResult()
-
-    stored_next_token, _ = db.get_sync_state(cfg.twitter_user_id)
-    next_token: str | None = None if full else None  # always start from newest
+    next_token: str | None = None
     new_tweet_ids: list[str] = []
 
-    logger.info("Starting sync (full=%s)", full)
+    logger.info("Fetching bookmarks from X API (full=%s)", full)
+    fetch_result = None
     while True:
         fetch_result = fetch_bookmarks(cfg.twitter_user_id, next_token)
         if not fetch_result.tweets:
@@ -51,37 +83,41 @@ def run_sync(full: bool = False) -> SyncResult:
         stop = False
         for tweet in fetch_result.tweets:
             if not full and db.tweet_exists(tweet.tweet_id):
-                logger.debug("Reached known tweet %s, stopping pagination", tweet.tweet_id)
                 stop = True
                 break
             db.upsert_tweet(tweet)
             new_tweet_ids.append(tweet.tweet_id)
             result.new_tweets += 1
-
-            # Register article URLs immediately so they appear in get_unarticled_urls()
             for url_obj in tweet.urls:
                 expanded = url_obj.get("expanded_url", "") or url_obj.get("url", "")
                 if expanded and should_extract_article(expanded):
-                    db.upsert_article(
-                        db.ArticleData(tweet_id=tweet.tweet_id, url=expanded, fetch_status=0)
-                    )
+                    db.upsert_article(db.ArticleData(tweet_id=tweet.tweet_id, url=expanded, fetch_status=0))
 
         if stop or not fetch_result.next_token:
             break
         next_token = fetch_result.next_token
 
-    db.set_sync_state(cfg.twitter_user_id, fetch_result.next_token if 'fetch_result' in dir() else None)
-    logger.info("Fetched %d new tweets", result.new_tweets)
+    db.set_sync_state(cfg.twitter_user_id, fetch_result.next_token if fetch_result else None)
+    logger.info("Fetched %d new tweets from X API", result.new_tweets)
+    return _process_pipeline(result, new_tweet_ids)
 
-    # Extract articles concurrently
+
+def _get_known_ids() -> set[str]:
+    conn = db.get_conn()
+    rows = conn.execute("SELECT tweet_id FROM tweets").fetchall()
+    return {r["tweet_id"] for r in rows}
+
+
+def _process_pipeline(result: SyncResult, new_tweet_ids: list[str]) -> SyncResult:
+    """Shared post-fetch pipeline: articles → embeddings → FTS → ideas → Notion."""
+    cfg = get_settings()
+
+    # Extract articles
     pending = db.get_unarticled_urls()
-    logger.info("Extracting %d article URLs", len(pending))
     if pending:
+        logger.info("Extracting %d article URLs", len(pending))
         with concurrent.futures.ThreadPoolExecutor(max_workers=_ARTICLE_WORKERS) as pool:
-            futures = {
-                pool.submit(extract_article, row["tweet_id"], row["url"]): row
-                for row in pending
-            }
+            futures = {pool.submit(extract_article, r["tweet_id"], r["url"]): r for r in pending}
             for fut in concurrent.futures.as_completed(futures):
                 try:
                     article = fut.result()
@@ -92,36 +128,31 @@ def run_sync(full: bool = False) -> SyncResult:
                     result.errors.append(str(exc))
                     logger.error("Article extraction error: %s", exc)
 
-    # Embed tweets
+    # Embed
     embedder = get_embedder()
     unembedded_tweets = db.get_unembedded_tweets(cfg.embed_model)
     if unembedded_tweets:
         logger.info("Embedding %d tweets", len(unembedded_tweets))
-        tweet_recs = embedder.embed_tweets(unembedded_tweets)
-        for rec in tweet_recs:
+        for rec in embedder.embed_tweets(unembedded_tweets):
             db.upsert_embedding(rec)
             result.new_embeddings += 1
 
-    # Embed articles
     unembedded_articles = db.get_unembedded_articles(cfg.embed_model)
     if unembedded_articles:
         logger.info("Embedding %d articles", len(unembedded_articles))
-        article_recs = embedder.embed_articles(unembedded_articles)
-        for rec in article_recs:
+        for rec in embedder.embed_articles(unembedded_articles):
             db.upsert_embedding(rec)
             result.new_embeddings += 1
 
-    # Update FTS index
     if new_tweet_ids:
         db.update_fts(new_tweet_ids)
 
-    # Extract core ideas via Claude API (skipped if ANTHROPIC_API_KEY not set)
-    cfg2 = get_settings()
-    if cfg2.anthropic_api_key:
-        tweets_without_ideas = db.get_tweets_without_ideas()
-        if tweets_without_ideas:
-            logger.info("Extracting ideas for %d tweets", len(tweets_without_ideas))
-        for row in tweets_without_ideas:
+    # Extract ideas
+    if cfg.anthropic_api_key:
+        todo = db.get_tweets_without_ideas()
+        if todo:
+            logger.info("Extracting ideas for %d tweets", len(todo))
+        for row in todo:
             article = db.get_best_article_for_tweet(row["tweet_id"])
             idea = extract_idea(
                 tweet_id=row["tweet_id"],
@@ -132,30 +163,23 @@ def run_sync(full: bool = False) -> SyncResult:
                 article_body=article["body_text"] if article else None,
             )
             if idea:
-                db.upsert_idea(
-                    db.IdeaData(
-                        tweet_id=idea.tweet_id,
-                        article_id=idea.article_id,
-                        summary=idea.summary,
-                        key_concepts=idea.key_concepts,
-                        category=idea.category,
-                        tags=idea.tags,
-                        relevance_score=idea.relevance_score,
-                    )
-                )
+                db.upsert_idea(db.IdeaData(
+                    tweet_id=idea.tweet_id, article_id=idea.article_id,
+                    summary=idea.summary, key_concepts=idea.key_concepts,
+                    category=idea.category, tags=idea.tags,
+                    relevance_score=idea.relevance_score,
+                ))
                 result.new_ideas += 1
-    else:
-        logger.debug("ANTHROPIC_API_KEY not set — skipping idea extraction")
 
-    # Publish new ideas to Notion (skipped if NOTION_* not configured)
-    if cfg2.notion_api_token and cfg2.notion_database_id:
+    # Publish to Notion
+    if cfg.notion_api_token and cfg.notion_database_id:
+        import json as _json
         from .notion_publisher import publish_idea
-        pending = db.get_unpublished_ideas()
-        if pending:
-            logger.info("Publishing %d ideas to Notion", len(pending))
-        for row in pending:
+        pending_notion = db.get_unpublished_ideas()
+        if pending_notion:
+            logger.info("Publishing %d ideas to Notion", len(pending_notion))
+        for row in pending_notion:
             try:
-                import json as _json
                 page_id = publish_idea(
                     tweet_id=row["tweet_id"],
                     author=row["author"],
@@ -173,13 +197,11 @@ def run_sync(full: bool = False) -> SyncResult:
                 )
                 db.set_notion_page_id(row["tweet_id"], page_id)
             except Exception as exc:
-                result.errors.append(f"Notion publish failed for {row['tweet_id']}: {exc}")
+                result.errors.append(f"Notion: {exc}")
                 logger.error("Notion publish error: %s", exc)
-    else:
-        logger.debug("NOTION_API_TOKEN/DATABASE_ID not set — skipping Notion publish")
 
     logger.info(
-        "Sync complete: %d tweets, %d articles, %d embeddings, %d ideas",
+        "Pipeline done: %d tweets, %d articles, %d embeddings, %d ideas",
         result.new_tweets, result.new_articles, result.new_embeddings, result.new_ideas,
     )
     return result

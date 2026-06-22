@@ -103,6 +103,14 @@ def search(query: str, mode: str, limit: int) -> None:
         console.print(f"   [dim]score={hit.score:.4f}[/]\n")
 
 
+@main.command("inspect-birdclaw")
+def inspect_birdclaw() -> None:
+    """Show what Birdclaw data is available on this machine (diagnostic)."""
+    from .birdclaw_reader import print_schema_report
+    from .config import get_settings
+    print_schema_report(get_settings().birdclaw_home or None)
+
+
 @main.command("notion-sync")
 @click.option("--json", "as_json", is_flag=True, help="Output unpublished ideas as JSON.")
 @click.option("--set-page-id", nargs=2, multiple=True, metavar="TWEET_ID PAGE_ID",

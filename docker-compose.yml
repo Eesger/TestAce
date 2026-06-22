@@ -5,5 +5,11 @@ services:
     env_file: .env          # contains all API keys + config
     volumes:
       - ./data:/data        # persists bookmarks.db between runs
+      # Mount the Birdclaw data directory so the container can read bookmarks.
+      # Set BIRDCLAW_HOME in .env to the Windows path, e.g.:
+      #   BIRDCLAW_HOME=C:\Users\Eesger\.birdclaw
+      - ${BIRDCLAW_HOME:-~/.birdclaw}:/birdclaw:ro
     environment:
       - DB_PATH=/data/bookmarks.db
+      # Inside the container the mount is always at /birdclaw
+      - BIRDCLAW_HOME=/birdclaw
